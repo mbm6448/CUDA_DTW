@@ -1,122 +1,80 @@
 #include "DTW.h"
-#include <cmath>
 #include <cuda_runtime.h>
-#include <iostream>
-#include <random>
+
+#define WARP_WIDTH 32
 
 DTW::DTW(int blockSize) : BLOCK_SIZE(blockSize) {}
-
-std::vector<double> DTW::generateRandomSequence(int length) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<double> dis(0.0, 1.0);
-
-    std::vector<double> sequence(length);
-    for (int i = 0; i < length; i++) {
-        sequence[i] = dis(gen);
-    }
-
-    return sequence;
-}
-
-__device__ double DTW::absoluteDifference(double x, double y) {
-    return fabs(x - y);
-}
-
-__global__ void DTW::dtwKernel(double *d, double *x, double *y, int n, int m) {
-    extern __shared__ double shared[];
-    double *s_x = shared;
-    double *s_y = &shared[blockDim.x];
-
-    int tid_x = threadIdx.x + blockIdx.x * blockDim.x;
-    int tid_y = threadIdx.y + blockIdx.y * blockDim.y;
-
-    if (tid_x < n && tid_y < m) {
-        s_x[threadIdx.x] = x[tid_x];
-        s_y[threadIdx.y] = y[tid_y];
-
-        __syncthreads();
-
-        double dtw[BLOCK_SIZE][BLOCK_SIZE] = {{0.0}};
-
-        dtw[0][0] = absoluteDifference(s_x[0], s_y[0]);
-
-        for (int i = 1; i < BLOCK_SIZE && tid_x + i < n; i++) {
-            dtw[i][0] = dtw[i - 1][0] + absoluteDifference(s_x[i], s_y[0]);
-        }
-
-        for (int i = 1; i < BLOCK_SIZE && tid_y + i < m; i++) {
-            dtw[0][i] = dtw[0][i - 1] + absoluteDifference(s_x[0], s_y[i]);
-        }
-
-        for (int i = 1; i < BLOCK_SIZE && tid_x + i < n; i++) {
-            for (int j = 1; j < BLOCK_SIZE && tid_y + j < m; j++) {
-                dtw[i][j] = absoluteDifference(s_x[i], s_y[j]) +
-                            fmin(dtw[i - 1][j],
-                                 fmin(dtw[i][j - 1], dtw[i - 1][j - 1]));
-            }
-        }
-
-        d[tid_x * m + tid_y] = dtw[BLOCK_SIZE - 1][BLOCK_SIZE - 1];
-    }
-}
 
 double DTW::compute(const std::vector<double>& x, const std::vector<double>& y) {
     int n = x.size();
     int m = y.size();
+    double *d_device, *x_device, *y_device;
+    std::vector<double> d(n * m);
 
-    double *d_d, *d_x, *d_y;
+    // Allocate memory on device
+    cudaMalloc((void**)&d_device, n * m * sizeof(double));
+    cudaMalloc((void**)&x_device, n * sizeof(double));
+    cudaMalloc((void**)&y_device, m * sizeof(double));
 
-    cudaError_t err = cudaMalloc((void **)&d_d, n * m * sizeof(double));
-    if (err != cudaSuccess) {
-        std::cerr << "Failed to allocate device vector d (error code " << cudaGetErrorString(err) << ")!\n";
-        cudaFree(d_d);
-        exit(EXIT_FAILURE);
+    // Copy input data to device
+    cudaMemcpy(x_device, x.data(), n * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(y_device, y.data(), m * sizeof(double), cudaMemcpyHostToDevice);
+
+    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 grid((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
+
+    dtwKernel<<<grid, block>>>(d_device, x_device, y_device, n, m, BLOCK_SIZE);
+
+    cudaMemcpy(d.data(), d_device, n * m * sizeof(double), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_device);
+    cudaFree(x_device);
+    cudaFree(y_device);
+
+    return d[n * m - 1];
+}
+
+std::vector<double> DTW::generateRandomSequence(int length) {
+    std::vector<double> sequence(length);
+    for(int i = 0; i < length; i++) {
+        sequence[i] = rand() / (double)RAND_MAX;
+    }
+    return sequence;
+}
+
+__device__ double absoluteDifference(double x, double y) {
+    return abs(x - y);
+}
+
+__global__ void dtwKernel(double *d, double *x, double *y, int n, int m, int blockSize) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Using shared memory for local block's data
+    __shared__ double localX[WARP_WIDTH];
+    __shared__ double localY[WARP_WIDTH];
+
+    if (threadIdx.x < blockSize && i < n) {
+        localX[threadIdx.x] = x[i];
+    }
+    if (threadIdx.y < blockSize && j < m) {
+        localY[threadIdx.y] = y[j];
     }
 
-    err = cudaMalloc((void **)&d_x, n * sizeof(double));
-    if (err != cudaSuccess) {
-        std::cerr << "Failed to allocate device vector x (error code " << cudaGetErrorString(err) << ")!\n";
-        cudaFree(d_d);
-        cudaFree(d_x);
-        exit(EXIT_FAILURE);
+    __syncthreads();
+
+    if (i < n && j < m) {
+        double cost = absoluteDifference(localX[threadIdx.x], localY[threadIdx.y]);
+
+        double diagonal = (i > 0 && j > 0) ? d[(i - 1) * m + (j - 1)] : INFINITY;
+        double left = (i > 0) ? d[(i - 1) * m + j] : INFINITY;
+        double top = (j > 0) ? d[i * m + (j - 1)] : INFINITY;
+
+        if (i == 0 && j == 0) {
+            d[i * m + j] = cost;
+        } else {
+            d[i * m + j] = cost + min(diagonal, min(left, top));
+        }
     }
-
-    err = cudaMalloc((void **)&d_y, m * sizeof(double));
-    if (err != cudaSuccess) {
-        std::cerr << "Failed to allocate device vector y (error code " << cudaGetErrorString(err) << ")!\n";
-        cudaFree(d_d);
-        cudaFree(d_x);
-        cudaFree(d_y);
-        exit(EXIT_FAILURE);
-    }
-
-    cudaMemcpyAsync(d_x, x.data(), n * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpyAsync(d_y, y.data(), m * sizeof(double), cudaMemcpyHostToDevice);
-
-    dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 dimGrid((n + dimBlock.x - 1) / dimBlock.x, (m + dimBlock.y - 1) / dimBlock.y);
-
-    dtwKernel<<<dimGrid, dimBlock, 2 * BLOCK_SIZE * sizeof(double)>>>(d_d, d_x, d_y, n, m);
-    err = cudaPeekAtLastError();
-    if (err != cudaSuccess) {
-        std::cerr << "CUDA kernel error: " << cudaGetErrorString(err) << "\n";
-        exit(EXIT_FAILURE);
-    }
-
-    cudaDeviceSynchronize();
-
-    std::vector<double> h_d(n * m);
-    cudaMemcpyAsync(h_d.data(), d_d, n * m * sizeof(double), cudaMemcpyDeviceToHost);
-
-    cudaDeviceSynchronize();
-
-    double dtw = h_d[n * m - 1];
-
-    cudaFree(d_d);
-    cudaFree(d_x);
-    cudaFree(d_y);
-
-    return dtw;
 }
 

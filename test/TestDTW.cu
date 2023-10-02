@@ -1,5 +1,5 @@
 #include "gtest/gtest.h"
-#include "../src/DTW.h"
+#include "../include/DTW.h"
 
 class DTWTestFixture : public ::testing::Test {
 protected:
