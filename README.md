@@ -1,4 +1,4 @@
-# Dynamic Time Warping (DTW) Acceleration with CUDA
+# Dynamic Time Warping Acceleration with CUDA
 
 This repo contains an advanced implementation of the Dynamic Time Warping (DTW) algorithm using CUDA. DTW is a similarity measure used to compare two temporal sequences, allowing for temporal shifts and distortions between them. Leveraging the parallel processing capabilities of CUDA-enabled GPUs, this implementation provides accelerated computation of the DTW distance between two sequences.
 
