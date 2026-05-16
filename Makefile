@@ -1,53 +1,82 @@
-# CUDA compiler
-NVCC = nvcc
+# CUDA DTW - build rules
+#
+# Targets:
+#   make            -> bin/dtw_test   (benchmark + functional driver)
+#   make test       -> runs gtest unit tests
+#   make bench      -> runs the benchmark driver
+#   make basic      -> runs functional tests only
+#   make query      -> bin/query (small CUDA device-info utility)
+#   make clean      -> remove build artifacts
 
-# Compiler flags
-NVCC_FLAGS = -O3 -arch=sm_70 -std=c++14
-NVCC_FLAGS += -Xcompiler -Wall -Xcompiler -Wextra
+NVCC  ?= nvcc
+CXX   ?= g++
 
+# Architectures. CUDA 13 dropped support for pre-Hopper (sm < 100), so this
+# is the supported range. Override on the command line if you need to retarget,
+# e.g.  make GENCODE_FLAGS="-gencode arch=compute_120,code=sm_120"
+GENCODE_FLAGS ?= \
+  -gencode arch=compute_100,code=sm_100 \
+  -gencode arch=compute_120,code=sm_120
 
-# Target executable
-TARGET = dtw_test
+NVCC_FLAGS := -O3 -std=c++17 $(GENCODE_FLAGS) -lineinfo \
+              -Xcompiler -fopenmp -Xcompiler -Wall -Xcompiler -Wextra \
+              -Iinclude
 
-# Source files
-SOURCES = main.cu DTW.cu
+LDFLAGS := -Xcompiler -fopenmp
 
-# Object files
-OBJECTS = main.o DTW.o
+BIN_DIR  := bin
+BUILD    := build
 
-# Default target
-all: $(TARGET)
+DTW_OBJ  := $(BUILD)/DTW.o
+MAIN_OBJ := $(BUILD)/main.o
+TEST_OBJ := $(BUILD)/TestDTW.o
+QUERY_OBJ:= $(BUILD)/query.o
 
-# Build target
-$(TARGET): $(OBJECTS)
+MAIN_BIN  := $(BIN_DIR)/dtw_test
+TEST_BIN  := $(BIN_DIR)/test_run
+QUERY_BIN := $(BIN_DIR)/query
+
+GTEST_LIBS := -lgtest -lgtest_main -lpthread
+
+.PHONY: all test bench basic query clean dirs
+
+all: dirs $(MAIN_BIN)
+
+dirs:
+	@mkdir -p $(BIN_DIR) $(BUILD)
+
+$(MAIN_BIN): $(MAIN_OBJ) $(DTW_OBJ)
+	$(NVCC) $(NVCC_FLAGS) $(LDFLAGS) -o $@ $^
+
+$(TEST_BIN): $(TEST_OBJ) $(DTW_OBJ)
+	$(NVCC) $(NVCC_FLAGS) $(LDFLAGS) -o $@ $^ $(GTEST_LIBS)
+
+$(QUERY_BIN): $(QUERY_OBJ)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $^
 
-# Compile main.cu
-main.o: main.cu DTW.h
-	$(NVCC) $(NVCC_FLAGS) -c main.cu -o $@
+$(DTW_OBJ): src/DTW.cu include/DTW.h | dirs
+	$(NVCC) $(NVCC_FLAGS) -c src/DTW.cu -o $@
 
-# Compile DTW.cu
-DTW.o: DTW.cu DTW.h
-	$(NVCC) $(NVCC_FLAGS) -c DTW.cu -o $@
+$(MAIN_OBJ): src/main.cu include/DTW.h | dirs
+	$(NVCC) $(NVCC_FLAGS) -c src/main.cu -o $@
 
-# Run all tests
-test: $(TARGET)
-	./$(TARGET) --all
+$(TEST_OBJ): test/TestDTW.cu include/DTW.h | dirs
+	$(NVCC) $(NVCC_FLAGS) -c test/TestDTW.cu -o $@
 
-# Run performance benchmark
-benchmark: $(TARGET)
-	./$(TARGET) --perf
+$(QUERY_OBJ): src/query.cu | dirs
+	$(NVCC) $(NVCC_FLAGS) -c src/query.cu -o $@
 
-# Run basic tests only
-basic: $(TARGET)
-	./$(TARGET) --basic
+test: dirs $(TEST_BIN)
+	./$(TEST_BIN)
 
-# Clean build files
+bench: $(MAIN_BIN)
+	./$(MAIN_BIN) --perf
+
+basic: $(MAIN_BIN)
+	./$(MAIN_BIN) --basic
+
+query: dirs $(QUERY_BIN)
+	./$(QUERY_BIN)
+
 clean:
-	rm -f $(OBJECTS) $(TARGET)
-
-# Install (optional - adjust path as needed)
-install: $(TARGET)
-	cp $(TARGET) /usr/local/bin/
-
-.PHONY: all test benchmark basic clean install
+	rm -rf $(BUILD) $(BIN_DIR)

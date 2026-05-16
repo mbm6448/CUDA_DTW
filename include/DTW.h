@@ -1,155 +1,147 @@
-// DTW.h - Header file for GPU-accelerated Dynamic Time Warping
+// DTW.h - GPU-accelerated Dynamic Time Warping
 #ifndef DTW_H
 #define DTW_H
 
 #include <vector>
 #include <functional>
-#include <limits>
+#include <string>
+#include <utility>
 
-/**
- * Dynamic Time Warping (DTW) implementation using CUDA
- * Computes the minimum distance between two time series
- * 
- * Features:
- * - Wave-front parallel approach for GPU acceleration
- * - Multi-dimensional sequence support
- * - Path extraction capability
- * - Sakoe-Chiba band constraint support
- * - Multiple distance metrics
- * - Robust error handling
+#include <cuda_runtime.h>
+
+/*
+ * Dynamic Time Warping on CUDA.
+ *
+ * Implementation notes (so the reviewer doesn't have to guess):
+ *   - Wave-front parallel: each anti-diagonal of the DP matrix is computed
+ *     in parallel, in order. Within a diagonal, all cells are independent.
+ *   - Anti-diagonal storage layout: cells of one diagonal are stored
+ *     contiguously, so a warp of threads accesses contiguous memory ->
+ *     fully coalesced global loads and stores.
+ *   - Rolling 3-buffer scheme: only the previous two diagonals are needed
+ *     to compute the next one, so device memory is O(min(n,m)) when the
+ *     alignment path is not requested.
+ *   - Shared memory holds the relevant slabs of the previous two diagonals
+ *     once per block; every neighbour read by every cell in the block is
+ *     then a shared-memory hit. (This is the actual shared-memory
+ *     optimization, not a memcpy with no reuse.)
+ *   - Sakoe-Chiba band: the host clips each diagonal's [k_lo, k_hi] to the
+ *     band so kernels only launch threads that do real work.
+ *
+ * Path extraction is the slow path; it allocates the full n*m matrix.
  */
 class DTW {
 public:
-    // Distance metric types
     enum DistanceType {
         EUCLIDEAN,
         MANHATTAN,
         ABSOLUTE,
         SQUARED
     };
-    
-    // Structure to hold DTW results
+
     struct DTWResult {
         double distance;
         std::vector<std::pair<int, int>> path;
         bool success;
         std::string error_message;
-        
+
         DTWResult() : distance(-1.0), success(false) {}
     };
-    
-    /**
-     * Constructor
-     * @param blockSize The CUDA block size to use for computation (default: 256)
-     * @param maxLength Maximum sequence length to pre-allocate (default: 10000)
-     * @param maxDim Maximum dimensions per point (default: 128)
-     */
+
     DTW(int blockSize = 256, int maxLength = 10000, int maxDim = 128);
-    
-    /**
-     * Destructor - cleans up GPU memory
-     */
     ~DTW();
-    
-    /**
-     * Compute the DTW distance between two 1D sequences
-     * @param x First sequence
-     * @param y Second sequence
-     * @param window Sakoe-Chiba band width (-1 for no constraint)
-     * @return The DTW distance, or -1.0 if an error occurred
-     */
+
+    // 1D convenience entry point. window < 0 means no constraint.
     double compute(const std::vector<double>& x, const std::vector<double>& y, int window = -1);
-    
-    /**
-     * Compute DTW distance between two multi-dimensional sequences
-     * @param x First sequence (n x dim)
-     * @param y Second sequence (m x dim)
-     * @param n Length of first sequence
-     * @param m Length of second sequence
-     * @param dim Dimensions per point
-     * @param distType Distance metric to use
-     * @param window Sakoe-Chiba band width (-1 for no constraint)
-     * @return DTWResult containing distance and optional path
-     */
+
+    // Multi-dim entry point. x has n*dim doubles, y has m*dim doubles, row-major.
     DTWResult computeMultiDim(const std::vector<double>& x, const std::vector<double>& y,
                               int n, int m, int dim,
                               DistanceType distType = EUCLIDEAN,
                               int window = -1);
-    
-    /**
-     * Compute DTW with path extraction
-     * @param x First sequence
-     * @param y Second sequence
-     * @param window Sakoe-Chiba band width (-1 for no constraint)
-     * @return DTWResult containing distance and alignment path
-     */
-    DTWResult computeWithPath(const std::vector<double>& x, const std::vector<double>& y, 
+
+    // Computes distance and the alignment path (slow path: allocates full n*m matrix).
+    DTWResult computeWithPath(const std::vector<double>& x, const std::vector<double>& y,
                               int window = -1);
-    
-    /**
-     * Compute DTW with custom distance function (CPU fallback)
-     * @param x First sequence
-     * @param y Second sequence
-     * @param distFunc Custom distance function
-     * @return The DTW distance
-     */
+
+    // CPU fallback for arbitrary distance functions.
     double computeCustom(const std::vector<double>& x, const std::vector<double>& y,
                          std::function<double(double, double)> distFunc);
-    
-    /**
-     * Get the full DTW matrix (for debugging/visualization)
-     * @param result Output matrix (must be pre-allocated to n*m)
-     * @param n Number of rows
-     * @param m Number of columns
-     * @return true if successful
-     */
+
+    // Copies the full DTW cost matrix from device to host.
+    // Only valid after computeWithPath() (the lean kernels don't keep it).
     bool getMatrix(std::vector<double>& result, int n, int m);
-    
-    /**
-     * Set whether to use shared memory optimization
-     * @param use true to enable shared memory optimization
-     */
+
+    // Toggle the shared-memory kernel. Default on. Off is mainly for benchmarking
+    // the contribution of the shared-memory tile vs the plain coalesced kernel.
     void setUseSharedMemory(bool use) { useSharedMemory = use; }
-    
-    /**
-     * Check if CUDA is available
-     * @return true if CUDA device is available
-     */
+
     static bool isCudaAvailable();
-    
-    /**
-     * Get CUDA device properties
-     * @return Device name or error message
-     */
     static std::string getCudaDeviceInfo();
-    
-    /**
-     * Generate a random sequence for testing
-     * @param length The length of the sequence
-     * @param dim Number of dimensions (default: 1)
-     * @return A vector containing random doubles between 0 and 1
-     */
+
+    // Generate length*dim random doubles in [0,1) for testing.
     static std::vector<double> generateRandomSequence(int length, int dim = 1);
+
+    // CPU reference implementations.
+    // Single-threaded plain DP. Used as the correctness oracle and as
+    // the "GPU vs 1 CPU thread" benchmark denominator.
+    static double cpuDtwSerial(const std::vector<double>& x,
+                               const std::vector<double>& y,
+                               int n, int m, int dim,
+                               DistanceType distType = ABSOLUTE,
+                               int window = -1);
+
+    // Wave-front parallel CPU using OpenMP. Used as the
+    // "GPU vs all CPU cores" benchmark denominator.
+    static double cpuDtwOpenMP(const std::vector<double>& x,
+                               const std::vector<double>& y,
+                               int n, int m, int dim,
+                               DistanceType distType = ABSOLUTE,
+                               int window = -1);
 
 private:
     int BLOCK_SIZE;
     int MAX_LENGTH;
     int MAX_DIM;
     bool useSharedMemory;
-    
-    // Device pointers
-    double *d_matrix;
-    double *d_x;
-    double *d_y;
-    
-    // Pre-allocated sizes
-    size_t allocated_matrix_size;
+
+    // Sequence buffers (device).
+    double* d_x;
+    double* d_y;
     size_t allocated_x_size;
     size_t allocated_y_size;
-    
-    // Helper methods
-    bool ensureMemoryAllocated(int n, int m, int dim);
+
+    // Three rolling diagonal buffers (device). Length = min(n,m)+2.
+    double* d_diag[3];
+    size_t allocated_diag_size;
+
+    // Full n*m matrix, allocated only when path extraction is requested.
+    double* d_full;
+    size_t allocated_full_size;
+    bool full_matrix_valid;
+
+    // CUDA Graph cache. The wave-front loop launches n+m-1 small kernels.
+    // We capture them into a graph on the first call with a given (n,m,dim,
+    // distType,window,useShared,withMatrix) tuple and replay it on every
+    // subsequent call. This collapses ~16k host-side launches at 8k size
+    // into one cudaGraphLaunch.
+    cudaStream_t graph_stream;
+    cudaGraph_t  cached_graph;
+    cudaGraphExec_t cached_exec;
+    bool   cache_valid;
+    int    cache_n, cache_m, cache_dim, cache_distType, cache_window;
+    bool   cache_useShared, cache_withMatrix;
+
+    bool ensureSequenceMem(int n, int m, int dim);
+    bool ensureDiagMem(int n, int m);
+    bool ensureFullMem(int n, int m);
+    void destroyCachedGraph();
     void cleanup();
+
+    DTWResult runLean(const std::vector<double>& x, const std::vector<double>& y,
+                      int n, int m, int dim, DistanceType distType, int window);
+    DTWResult runWithMatrix(const std::vector<double>& x, const std::vector<double>& y,
+                            int n, int m, int dim, DistanceType distType, int window);
     DTWResult extractPath(int n, int m);
 };
 
